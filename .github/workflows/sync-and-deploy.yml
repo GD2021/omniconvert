@@ -1,0 +1,167 @@
+name: Sync Upstream & Deploy
+
+on:
+  schedule:
+    # 每天北京时间 04:07 (UTC 20:07) 自动检查官方上游更新并验证部署
+    - cron: "7 20 * * *"
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: "强制执行构建与重新部署（即使无上游更新）"
+        type: boolean
+        default: false
+  push:
+    branches:
+      - main
+    paths:
+      - "index.html"
+      - "css/**"
+      - "js/**"
+      - "vendor/**"
+      - "assets/**"
+      - "scripts/**"
+      - "wrangler.jsonc"
+      - ".github/workflows/sync-and-deploy.yml"
+
+concurrency:
+  group: sync-and-deploy
+  cancel-in-progress: false
+
+jobs:
+  sync-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      issues: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Check and merge upstream updates
+        id: sync
+        run: |
+          git remote add upstream https://github.com/Fatallove101/omniconvert.git || true
+          git fetch upstream main --tags
+
+          LOCAL_REV=$(git rev-parse HEAD)
+          UPSTREAM_REV=$(git rev-parse upstream/main)
+          MERGE_BASE=$(git merge-base HEAD upstream/main)
+
+          echo "local_rev=$LOCAL_REV" >> "$GITHUB_OUTPUT"
+          echo "upstream_rev=$UPSTREAM_REV" >> "$GITHUB_OUTPUT"
+          echo "Current local revision: $LOCAL_REV"
+          echo "Current upstream revision: $UPSTREAM_REV"
+          echo "Merge base: $MERGE_BASE"
+
+          if [ "$UPSTREAM_REV" != "$MERGE_BASE" ]; then
+            echo "Upstream has new commits."
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+            echo "### Upstream Commits" >> $GITHUB_STEP_SUMMARY
+            git log --oneline ${MERGE_BASE}..upstream/main >> $GITHUB_STEP_SUMMARY
+
+            # 备份定制的 Cloudflare 部署配置，防止被上游覆盖
+            cp wrangler.jsonc wrangler.jsonc.bak 2>/dev/null || true
+
+            # 尝试合并上游变更
+            if ! git merge upstream/main --no-edit -m "chore: sync upstream Fatallove101/omniconvert ($(date -u +'%Y-%m-%d %H:%M:%S UTC'))"; then
+              echo "::error::Merge conflict detected! Aborting merge to prevent breaking production."
+              git merge --abort
+              echo "merge_conflict=true" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+
+            # 恢复定制部署配置
+            if [ -f wrangler.jsonc.bak ]; then
+              cp wrangler.jsonc.bak wrangler.jsonc
+              rm -f wrangler.jsonc.bak
+              if [ -n "$(git status --porcelain wrangler.jsonc)" ]; then
+                git add wrangler.jsonc
+                git commit -m "chore: preserve custom Cloudflare deployment configuration" || true
+              fi
+            fi
+
+            echo "merge_conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Repository is already up to date with upstream."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "merge_conflict=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine if deployment is needed
+        id: check_deploy
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "Reason: push event on main branch"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force_deploy }}" = "true" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "Reason: manual force deployment requested"
+          elif [ "${{ steps.sync.outputs.has_changes }}" = "true" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "Reason: upstream changes merged successfully"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "Reason: no upstream changes and not forced"
+          fi
+
+      - name: Setup Node.js
+        if: steps.check_deploy.outputs.deploy == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run verification tests
+        if: steps.check_deploy.outputs.deploy == 'true'
+        run: |
+          node test/test-docs.mjs
+          node test/test-check-music.mjs
+
+      - name: Build static site
+        if: steps.check_deploy.outputs.deploy == 'true'
+        run: |
+          node scripts/build-web.mjs
+          if [ ! -f "dist/index.html" ]; then
+            echo "::error::Build verification failed: dist/index.html is missing!"
+            exit 1
+          fi
+
+      - name: Push merged changes to origin
+        if: steps.check_deploy.outputs.deploy == 'true' && steps.sync.outputs.has_changes == 'true'
+        run: |
+          git push origin main
+
+      - name: Deploy to Cloudflare Workers
+        if: steps.check_deploy.outputs.deploy == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "::error::CLOUDFLARE_API_TOKEN is not configured in GitHub Secrets. Please configure it in repo settings."
+            exit 1
+          fi
+          npx wrangler deploy
+
+      - name: Post-deployment Health Check
+        if: steps.check_deploy.outputs.deploy == 'true'
+        run: |
+          echo "Waiting 5 seconds for Cloudflare edge propagation..."
+          sleep 5
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://omniconvert.lucky.cloudns.biz/)
+          echo "Health check HTTP status: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "::error::Health check returned status $HTTP_STATUS (expected 200)"
+            exit 1
+          fi
+          echo "Health check passed: https://omniconvert.lucky.cloudns.biz/ is healthy!"

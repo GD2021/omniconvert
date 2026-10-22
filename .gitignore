@@ -9,6 +9,7 @@ src-tauri/target/
 src-tauri/gen/
 
 # 系统文件
+.wrangler/
 Thumbs.db
 Desktop.ini
 
